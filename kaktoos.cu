@@ -5,26 +5,27 @@
 #define RNG_ADD 11ULL
 #define RNG_MASK ((1ULL << 48) - 1)
 
-#ifndef GPU_COUNT
-#define GPU_COUNT 1
-#endif
-#ifndef BEGIN
-#define BEGIN 0
-#endif
-#ifndef END
-#define END (1ULL << 48)
-#endif
 #ifndef CACTUS_HEIGHT
 #define CACTUS_HEIGHT 9
 #endif
+
 #ifndef FLOOR_LEVEL
-#define FLOOR_LEVEL 63
+#define FLOOR_LEVEL 62
 #endif
 
 #include <chrono>
 #include <cstdint>
 #include <mutex>
 #include <thread>
+
+#include <cuda.h>
+
+#ifdef BOINC
+  #include "boinc_api.h"
+#if defined _WIN32 || defined _WIN64
+  #include "boinc_win.h"
+#endif
+#endif
 
 __device__ uint64_t block_add_gpu[BLOCK_SIZE + 1];
 __device__ uint64_t block_mul_gpu[BLOCK_SIZE + 1];
@@ -200,14 +201,23 @@ uint64_t chunk_mul[CHUNK_SIZE + 1];
 uint64_t offset = 0;
 uint64_t seed = 0;
 uint64_t total_seeds = 0;
-std::mutex mutex;
-std::thread threads[GPU_COUNT];
+time_t elapsed_chkpoint = 0;
+std::mutex mutexcuda;
+std::thread threads[1];
 
-void run(int32_t gpu)
+unsigned long long BEGIN;
+unsigned long long END;
+
+struct checkpoint_vars {
+uint64_t offset;
+time_t elapsed_chkpoint;
+};
+
+void run(int gpu_device)
 {
 	uint64_t *out;
 	uint64_t *out_n;
-	cudaSetDevice(gpu);
+	cudaSetDevice(gpu_device);
 	cudaMallocManaged(&out, GRID_SIZE * sizeof(*out));
 	cudaMallocManaged(&out_n, sizeof(*out_n));
 	cudaMemcpyToSymbol(block_add_gpu, block_add, (BLOCK_SIZE + 1) * sizeof(*block_add));
@@ -218,7 +228,7 @@ void run(int32_t gpu)
 	while (true) {
 		*out_n = 0;
 		{
-			std::lock_guard<std::mutex> lock(mutex);
+			std::lock_guard<std::mutex> lock(mutexcuda);
 			if (offset >= END) break;
 			uint64_t seed_gpu = (seed * RNG_MUL + RNG_ADD) & RNG_MASK;
 			crack<<<CHUNK_SIZE, BLOCK_SIZE>>>(seed_gpu, out, out_n);
@@ -227,11 +237,11 @@ void run(int32_t gpu)
 		}
 		cudaDeviceSynchronize();
 		{
-			std::lock_guard<std::mutex> lock(mutex);
+			std::lock_guard<std::mutex> lock(mutexcuda);
 			total_seeds += *out_n;
 			for (uint64_t i = 0; i < *out_n; i++)
-				printf("%lu\n", out[i]);
-			fflush(stdout);
+				fprintf(stderr,"%lu\n", out[i]);
+			fflush(stderr);
 		}
 	}
 
@@ -239,8 +249,16 @@ void run(int32_t gpu)
 	cudaFree(out);
 }
 
-int main()
+int main(int argc, char *argv[])
 {
+	#ifdef BOINC
+	BOINC_OPTIONS options;
+
+	boinc_options_defaults(options);
+	options.normal_thread_priority = true;
+	boinc_init_options(&options);
+	#endif
+	
 	block_add[0] = 0;
 	block_mul[0] = 1;
 	for (uint64_t i = 0; i < BLOCK_SIZE; i++) {
@@ -254,28 +272,118 @@ int main()
 		chunk_add[i + 1] = (chunk_add[i] * block_mul[BLOCK_SIZE] + block_add[BLOCK_SIZE]) & RNG_MASK;
 		chunk_mul[i + 1] = (chunk_mul[i] * block_mul[BLOCK_SIZE]) & RNG_MASK;
 	}
+	
+	int gpu_device = 0;
+	for (int i = 1; i < argc; i += 2) {
+		const char *param = argv[i];
+		if (strcmp(param, "-d") == 0 || strcmp(param, "--device") == 0) {
+			gpu_device = atoi(argv[i + 1]);
+		} else if (strcmp(param, "-s") == 0 || strcmp(param, "--start") == 0) {
+			sscanf(argv[i + 1], "%llu", &BEGIN);
+		} else if (strcmp(param, "-e") == 0 || strcmp(param, "--end") == 0) {
+			sscanf(argv[i + 1], "%llu", &END);
+		} else {
+			fprintf(stderr,"Unknown parameter: %s\n", param);
+		}
+	}
+
+	FILE *checkpoint_data = boinc_fopen("kaktpoint.txt", "rb");
+
+	if (!checkpoint_data) {
+		fprintf(stderr,"No checkpoint to load\n");
+	} else {
+		#ifdef BOINC
+		boinc_begin_critical_section();
+		#endif 
+
+		struct checkpoint_vars data_store;
+		fread(&data_store, sizeof(data_store), 1, checkpoint_data);
+
+		BEGIN = data_store.offset;
+		elapsed_chkpoint = data_store.elapsed_chkpoint;
+
+		fprintf(stderr,"Checkpoint loaded, task time %d s, seed pos: %llu\n", elapsed_chkpoint, BEGIN);
+		fclose(checkpoint_data);
+		
+		#ifdef BOINC
+		boinc_end_critical_section();
+		#endif
+	}
 
 	for (; offset + GRID_SIZE <= BEGIN; offset += GRID_SIZE)
 		seed = (seed * chunk_mul[CHUNK_SIZE] + chunk_add[CHUNK_SIZE]) & RNG_MASK;
 	for (; offset + 1 <= BEGIN; offset += 1)
 		seed = (seed * RNG_MUL + RNG_ADD) & RNG_MASK;
 
-	for (int i = 0; i < GPU_COUNT; i++)
-		threads[i] = std::thread(run, i);
+	#ifdef BOINC
+	APP_INIT_DATA aid;
+	boinc_get_init_data(aid);
+	
+	if (aid.gpu_device_num >= 0) {
+		gpu_device = aid.gpu_device_num;
+		fprintf(stderr,"boinc gpu %i gpuindex: %i \n", aid.gpu_device_num, gpu_device);
+		} else {
+		fprintf(stderr,"stndalone gpuindex %i \n", gpu_device);
+	}
+	#endif
+
+	threads[0] = std::thread(run, gpu_device);
 
 	time_t start_time = time(NULL);
 	while (offset < END) {
 		using namespace std::chrono_literals;
-		std::this_thread::sleep_for(1s);
+		std::this_thread::sleep_for(20s);
 		time_t elapsed = time(NULL) - start_time;
 		uint64_t count = offset - BEGIN;
 		double frac = (double) count / (double) (END - BEGIN);
-		double done = (double) count / 1000000.0;
-		double speed = done / (double) elapsed;
-		fprintf(stderr, "%10.2fb %7lis %8.2fm/s %6.2f%% =%-6lu\n", done / 1000, elapsed, speed, frac * 100.0, total_seeds);
+		
+		#ifdef BOINC
+		boinc_fraction_done(frac);
+		#endif
+		
+		#ifdef BOINC
+		boinc_begin_critical_section(); // Boinc should not interrupt this
+		#endif
+		
+		// Checkpointing section below
+			boinc_delete_file("kaktpoint.txt"); // Don't touch, same func as normal fdel
+			FILE *checkpoint_data = boinc_fopen("kaktpoint.txt", "wb");
+
+			struct checkpoint_vars data_store;
+			data_store.offset = offset;
+			data_store.elapsed_chkpoint = elapsed_chkpoint + elapsed;
+
+			fwrite(&data_store, sizeof(data_store), 1, checkpoint_data);
+
+			fclose(checkpoint_data);
+
+		#ifdef BOINC
+		boinc_end_critical_section();
+		boinc_checkpoint_completed(); // Checkpointing completed
+		#endif
 	}
+	
+	#ifdef BOINC
+	boinc_begin_critical_section();
+	#endif
 
 	for (std::thread& thread : threads)
 		thread.join();
-	return 0;
+
+	time_t elapsed = time(NULL) - start_time;
+	uint64_t count = offset - BEGIN;
+	double frac = (double) count / (double) (END - BEGIN);
+	double done = (double) count / 1000000.0;
+	double speed = done / (double) elapsed;
+
+	fprintf(stderr, "%10.2fb %7lis %8.2fm/s %6.2f%% =%-6lu\n", done / 1000, elapsed_chkpoint + elapsed, speed, frac * 100.0, total_seeds);
+	fprintf(stderr, "Done!\n");
+
+	fflush(stderr);
+	
+	#ifdef BOINC
+	boinc_end_critical_section();
+	#endif
+
+	boinc_finish(0);
 }

@@ -1,0 +1,39 @@
+name: cuda-cross-build
+
+on: [push]
+
+jobs:
+  windows_cuda:
+    name: cuda/release/windows
+    runs-on: [windows-latest]
+    steps:
+    - uses: actions/checkout@v2
+    - uses: ilammy/msvc-dev-cmd@v1
+    - name: setup
+      run: |
+        choco install cuda --version=10.1 -y
+    - name: configure
+      run: |
+        echo "##[add-path]C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v10.1\bin;C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v10.1\include;C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v10.1\lib\x64;C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v10.1\extras\CUPTI\libx64;C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v10.1\lib"
+    - name: build
+      run: |
+        nvcc kaktoos.cu -o kaktoos-cuda.exe -O3 -m=64 -Xptxas -v -ID:\a\Kaktoos\Kaktoos\boinc\ -ID:\a\Kaktoos\Kaktoos\boinc\win\ -LD:\a\Kaktoos\Kaktoos\boinc\lib\win\ -lboinc_api -lboinc -lcuda -luser32 -DBOINC -D_WIN32
+        dir
+    - uses: actions/upload-artifact@v2
+      with:
+       name: kaktoos-cuda-win
+       path: .\kaktoos*.exe
+  linux_cuda:
+    name: cuda/release/linux
+    runs-on: [ubuntu-latest]
+    container: nvidia/cuda:10.0-devel-ubuntu18.04
+    steps:
+    - uses: actions/checkout@v2
+    - name: build
+      run: |
+        nvcc kaktoos.cu -Xcompiler -static-libgcc -Xcompiler -static-libstdc++ -m64 -O3 -o kaktoos-cuda -DBOINC -Iboinc/ -Lboinc/lib/lin -lcuda -lboinc_api -lboinc -Xptxas -v
+        ls -la
+    - uses: actions/upload-artifact@v2
+      with:
+       name: kaktoos-cuda-lin
+       path: ./kaktoos-cuda*
